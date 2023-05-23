@@ -5,7 +5,9 @@
 /// A Store of values accessible through [Handle]s.
 #[derive(Debug)]
 pub struct Store<T> {
-	values: Vec<(usize, Slot<T>)>,
+	values: Vec<Slot<T>>,
+	/// Tracking value for the number of allocations to enure
+	/// that every [Handle] is unique.
 	alloc_idx: usize,
 }
 
@@ -27,21 +29,20 @@ impl<T> Store<T> {
 		self.values.clear()
 	}
 
-	fn _insert(&mut self, value: Slot<T>) -> Handle<T> {
+	/// Insert a value into the Store, returning a [Handle] to its [Slot].
+	pub fn insert(&mut self, value: T) -> Handle<T> {
 		let handle = Handle::new(self.values.len(), self.alloc_idx);
-		self.values.push((self.alloc_idx, value));
+		self.values.push(Slot::new_occupied(value, self.alloc_idx));
 		self.alloc_idx += 1;
 		handle
 	}
 
-	/// Insert a value into the Store, returning a [Handle] to it.
-	pub fn insert(&mut self, value: T) -> Handle<T> {
-		self._insert(Slot::Occupied(value))
-	}
-
-	/// Allocate space within the Store and return a [Handle] to it.
+	/// Allocate a [Slot] within the Store and return a [Handle] to it.
 	pub fn alloc(&mut self) -> Handle<T> {
-		self._insert(Slot::Empty)
+		let handle = Handle::new(self.values.len(), self.alloc_idx);
+		self.values.push(Slot::new_empty(self.alloc_idx));
+		self.alloc_idx += 1;
+		handle
 	}
 
 	fn check_handle(handle: Handle<T>, stored_alloc_idx: usize) -> Result<()> {
@@ -61,31 +62,29 @@ impl<T> Store<T> {
 
 	/// Set the value at `handle` to `value`, if the given [Handle]
 	/// points at something.
-	pub fn set(&mut self, handle: Handle<T>, value: T) -> Result<()> {
+	/// Returns the previous [Slot].
+	pub fn set(&mut self, handle: Handle<T>, value: T) -> Result<Option<T>> {
 		match self.values.get_mut(handle.index) {
-			Some((ai, v)) => {
-				Store::check_handle(handle, *ai)?;
-
-				*v = Slot::Occupied(value)
+			Some(slot) => {
+				Store::check_handle(handle, slot.alloc_idx)?;
+				Ok(slot.swap(value))
 			},
 			None => {
 				Self::check_handle(handle, self.alloc_idx)?;
-				return Err(StoreError::StoreMutated);
+				Err(StoreError::StoreMutated)
 			},
 		}
-
-		Ok(())
 	}
 
 	/// Remove the value at `handle`, if present, and return it,
-	/// leaving the space empty.
+	/// leaving the slot empty.
 	pub fn take(&mut self, handle: Handle<T>) -> Result<T> {
-		let (ai, o) = self.values.get_mut(handle.index)
+		let slot = self.values.get_mut(handle.index)
 			.ok_or(StoreError::StoreMutated)?;
 
-		Self::check_handle(handle, *ai)?;
+		Self::check_handle(handle, slot.alloc_idx)?;
 
-		o.take().ok_or(StoreError::SlotEmpty)
+		slot.take().ok_or(StoreError::SlotEmpty)
 	}
 
 	/// Get a reference to the value at `handle`, if present.
@@ -95,10 +94,9 @@ impl<T> Store<T> {
 	/// if `handle` is invalid.
 	pub fn get(&self, handle: Handle<T>) -> Result<&T> {
 		match self.values.get(handle.index) {
-			Some((ai, v)) => {
-				Self::check_handle(handle, *ai)?;
-
-				v.as_ref().ok_or(StoreError::SlotEmpty)
+			Some(slot) => {
+				Self::check_handle(handle, slot.alloc_idx)?;
+				slot.as_ref().ok_or(StoreError::SlotEmpty)
 			},
 			None => {
 				Self::check_handle(handle, self.alloc_idx)?;
@@ -108,8 +106,8 @@ impl<T> Store<T> {
 	}
 
 	/// Get a reference to the value at `handle`, evading all safety checks.
-	pub unsafe fn get_unchecked(&self, handle: Handle<T>) -> Slot<&T> {
-		self.values.get_unchecked(handle.index).1.as_ref()
+	pub unsafe fn get_unchecked(&self, handle: Handle<T>) -> Option<&T> {
+		self.values.get_unchecked(handle.index).as_ref()
 	}
 
 	/// Get a mutable reference to the value at `handle`, if present.
@@ -119,10 +117,9 @@ impl<T> Store<T> {
 	/// if `handle` is invalid.
 	pub fn get_mut(&mut self, handle: Handle<T>) -> Result<&mut T> {
 		match self.values.get_mut(handle.index) {
-			Some((ai, v)) => {
-				Self::check_handle(handle, *ai)?;
-
-				v.as_mut().ok_or(StoreError::SlotEmpty)
+			Some(slot) => {
+				Self::check_handle(handle, slot.alloc_idx)?;
+				slot.as_mut().ok_or(StoreError::SlotEmpty)
 			},
 			None => {
 				Self::check_handle(handle, self.alloc_idx)?;
@@ -132,22 +129,22 @@ impl<T> Store<T> {
 	}
 
 	/// Get a mutable reference to the value at `handle`, evading all safety checks.
-	pub unsafe fn get_unchecked_mut(&mut self, handle: Handle<T>) -> Slot<&mut T> {
-		self.values.get_unchecked_mut(handle.index).1.as_mut()
+	pub unsafe fn get_unchecked_mut(&mut self, handle: Handle<T>) -> Option<&mut T> {
+		self.values.get_unchecked_mut(handle.index).as_mut()
 	}
 }
 
 impl<T> std::ops::Index<Handle<T>> for Store<T> {
-	type Output = Slot<T>;
+	type Output = Option<T>;
 
 	fn index(&self, index: Handle<T>) -> &Self::Output {
-		&self.values[index.index].1
+		&self.values[index.index].value
 	}
 }
 
 impl<T> std::ops::IndexMut<Handle<T>> for Store<T> {
 	fn index_mut(&mut self, index: Handle<T>) -> &mut Self::Output {
-		&mut self.values[index.index].1
+		&mut self.values[index.index].value
 	}
 }
 
@@ -177,49 +174,49 @@ impl<T> std::fmt::Debug for Handle<T> {
 }
 
 
+/// A slot of some data.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, PartialOrd)]
-pub enum Slot<T> {
-	Occupied(T),
-	Empty,
+pub struct Slot<T> {
+	pub(self) value: Option<T>,
+	/// The allocation index to ensure [Handle] uniqueness.
+	pub(self) alloc_idx: usize,
 }
 
 impl<T> Slot<T> {
-	pub fn take(&mut self) -> Slot<T> {
-		std::mem::replace(self, Slot::Empty)
-	}
-
-	pub fn ok_or<E>(self, err: E) -> std::result::Result<T, E> {
-		match self {
-			Self::Occupied(v) => Ok(v),
-			Self::Empty => Err(err)
+	pub(self) fn new_empty(alloc_idx: usize) -> Self {
+		Self {
+			value: None,
+			alloc_idx,
 		}
 	}
 
-	pub fn as_ref(&self) -> Slot<&T> {
-		match self {
-			Self::Occupied(v) => Slot::Occupied(v),
-			Self::Empty => Slot::Empty,
+	pub(self) fn new_occupied(val: T, alloc_idx: usize) -> Self {
+		Self {
+			value: Some(val),
+			alloc_idx,
 		}
 	}
 
-	pub fn as_mut(&mut self) -> Slot<&mut T> {
-		match self {
-			Self::Occupied(v) => Slot::Occupied(v),
-			Self::Empty => Slot::Empty,
-		}
+	pub fn take(&mut self) -> Option<T> {
+		std::mem::replace(&mut self.value, None)
 	}
 
-	pub fn unwrap(self) -> T {
-		match self {
-			Self::Occupied(v) => v,
-			Self::Empty => panic!("called `Slot::unwrap()` on an `Occupied` value")
-		}
+	pub fn swap(&mut self, val: T) -> Option<T> {
+		std::mem::replace(&mut self.value, Some(val))
 	}
 }
 
-impl<T> Default for Slot<T> {
-	fn default() -> Self {
-		Self::Empty
+impl<T> std::ops::Deref for Slot<T> {
+	type Target = Option<T>;
+
+	fn deref(&self) -> &Self::Target {
+		&self.value
+	}
+}
+
+impl<T> std::ops::DerefMut for Slot<T> {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		&mut self.value
 	}
 }
 
@@ -250,15 +247,15 @@ fn test() {
 
 	// get, get_unchecked
 	assert_eq!(store.get(handle), Ok(&12));
-	assert_eq!(&store[handle], &Slot::Occupied(12));
+	assert_eq!(&store[handle], &Some(12));
 
 	// get_mut, get_mut_unchecked
 	assert_eq!(store.get_mut(handle), Ok(&mut 12));
 
 	let mut_ref = &mut store[handle];
-	assert_eq!(mut_ref, &mut Slot::Occupied(12));
+	assert_eq!(mut_ref, &mut Some(12));
 
-	*mut_ref = Slot::Occupied(14);
+	*mut_ref = Some(14);
 	assert_eq!(store.get(handle), Ok(&14));
 
 
